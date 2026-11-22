@@ -1,0 +1,5 @@
+Python : 3.13.16
+PyTorch: 2.14.1+cu130
+NumPy  : 2.4.6
+TabPFN : 10.2.0
+GPU    : Tesla T4
