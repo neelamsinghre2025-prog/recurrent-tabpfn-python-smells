@@ -1,0 +1,157 @@
+!pip install -q tabpfn openpyxl
+import time,os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.feature_selection import chi2, mutual_info_classif
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, matthews_corrcoef, roc_auc_score,
+                             confusion_matrix)
+from imblearn.over_sampling import SMOTE
+from tabpfn import TabPFNClassifier
+# settings
+CSV_PATH = "/content/Python_LargeClassSmell_Dataset.csv"
+TARGET = "LargeClass"     # spelling as in the original dataset
+K = 14                        # number of features kept by each selection method
+SEED = 42
+N_FOLDS = 10                   # number of cross-validation folds
+USE_SMOTE = True               # balance the training data with SMOTE
+SMOTE_K = 10                    # neighbours SMOTE uses to create synthetic samples
+DEVICE = "auto"                # "cuda" if you have a GPU, otherwise "cpu"
+os.environ["TABPFN_TOKEN"] = "tabpfn_sk_LTwQXW3wfQnj6p0YPEpddmCbrovsV6fDUE2xRjnfDFQ"
+
+# STEP 1 - LOAD THE DATA and Remove Duplicates
+
+df = pd.read_csv(CSV_PATH)
+df.columns = df.columns.str.strip()
+print("Rows before de-duplication:", len(df))
+df = df.drop_duplicates().reset_index(drop=True)
+print("Rows after de-duplication: ", len(df))
+
+X = df.drop(columns=[TARGET])
+y = df[TARGET]
+if y.dtype == object:          # turn text labels into 0/1 if needed
+    y = y.astype("category").cat.codes
+y = y.astype(int)
+X = X.select_dtypes(include=[np.number])
+print("Class counts:", y.value_counts().to_dict())
+print("Number of features:", X.shape[1])
+
+# divide the data 9:1 (90% train, 10% test) Done before feature selection, SMOTE and training, so the test set is never seen by any of them. Stratified = same clean/smelly ratio in both.
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.10, stratify=y, random_state=SEED)
+print(f"\n9:1 split -> train: {len(X_train)} rows {y_train.value_counts().to_dict()} | "
+      f"test: {len(X_test)} rows {y_test.value_counts().to_dict()}")
+X_train.assign(**{TARGET: y_train}).to_csv("train_90.csv", index=False)
+X_test.assign(**{TARGET: y_test}).to_csv("test_10.csv", index=False)
+print("Saved train_90.csv and test_10.csv")
+
+# SMOTE
+
+def balance(Xa, ya, label=""):
+    """SMOTE on TRAINING data only. Validation/test data never come here."""
+    if not USE_SMOTE:
+        return Xa, ya
+    before = ya.value_counts().to_dict()
+    Xb, yb = SMOTE(k_neighbors=SMOTE_K, random_state=SEED).fit_resample(Xa, ya)
+    if label:
+        print(f"  SMOTE {label}: {before} -> {pd.Series(yb).value_counts().to_dict()}")
+    return Xb, yb
+
+# feature selection
+
+def fisher_score(Xa, ya):
+    Xa, ya = np.asarray(Xa, float), np.asarray(ya)
+    mu = Xa.mean(axis=0)
+    num = np.zeros(Xa.shape[1]); den = np.zeros(Xa.shape[1])
+    for c in np.unique(ya):
+        Xc = Xa[ya == c]
+        num += len(Xc) * (Xc.mean(axis=0) - mu) ** 2
+        den += len(Xc) * Xc.var(axis=0)
+    return num / (den + 1e-12)
+
+def select_features(method, Xa, ya):
+    """Pick features using the TRAINING data only (no test leakage)."""
+    cols = Xa.columns
+    if method == "All features":
+        return list(cols)
+    if method == "Chi-Square":
+        scores, _ = chi2(MinMaxScaler().fit_transform(Xa), ya)
+    elif method == "Information Gain":
+        scores = mutual_info_classif(Xa, ya, random_state=SEED)
+    elif method == "Fisher Score":
+        scores = fisher_score(Xa, ya)
+    scores = np.nan_to_num(scores)
+    return list(cols[np.argsort(scores)[::-1][:min(K, len(cols))]])
+
+# evaluation
+
+def metrics(y_true, y_pred, y_prob):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred, zero_division=0),
+        "Recall": recall_score(y_true, y_pred, zero_division=0),
+        "F1": f1_score(y_true, y_pred, zero_division=0),
+        "MCC": matthews_corrcoef(y_true, y_pred),
+        "ROC-AUC": roc_auc_score(y_true, y_prob),
+        "TN": tn, "FP": fp, "FN": fn, "TP": tp,
+    }
+
+def fit_predict(Xtr, ytr, Xte):
+    model = TabPFNClassifier(device=DEVICE, random_state=SEED)
+    model.fit(Xtr, ytr)                       # no training loop, no tuning
+    prob = model.predict_proba(Xte)[:, 1]
+    return (prob >= 0.5).astype(int), prob
+
+methods = ["All features", "Chi-Square", "Information Gain", "Fisher Score"]
+cv_rows, test_rows, chosen = [], [], []
+skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+
+for m in methods:
+    print(f"\n=== {m} ===")
+    # 10-fold CV on the training part (features re-selected inside each fold)
+    fold_scores = []
+    for fold, (tr, va) in enumerate(skf.split(X_train, y_train), 1):
+        Xtr, Xva = X_train.iloc[tr], X_train.iloc[va]
+        ytr, yva = y_train.iloc[tr], y_train.iloc[va]
+        feats = select_features(m, Xtr, ytr)              # on real data
+        Xbal, ybal = balance(Xtr[feats], ytr, f"fold {fold}" if m == methods[0] else "")
+        pred, prob = fit_predict(Xbal, ybal, Xva[feats])  # Xva stays real
+        s = metrics(yva, pred, prob); s.update({"Method": m, "Fold": fold})
+        fold_scores.append(s); cv_rows.append(s)
+        print(f"  fold {fold}: Acc={s['Accuracy']:.4f} F1={s['F1']:.4f} MCC={s['MCC']:.4f}")
+
+    # final model: select on full 90% train, test on the held-out 10%
+    feats = select_features(m, X_train, y_train)
+    Xbal, ybal = balance(X_train[feats], y_train, "full train")
+    t0 = time.time()
+    pred, prob = fit_predict(Xbal, ybal, X_test[feats])   # test set stays real
+    t = metrics(y_test, pred, prob)
+    t.update({"Method": m, "Seconds": round(time.time() - t0, 2),
+              "CV mean F1": np.mean([f["F1"] for f in fold_scores]),
+              "CV mean MCC": np.mean([f["MCC"] for f in fold_scores])})
+    test_rows.append(t)
+    chosen.append({"Method": m, "Features": ", ".join(feats)})
+    print(f"  TEST: Acc={t['Accuracy']:.4f} F1={t['F1']:.4f} "
+          f"MCC={t['MCC']:.4f} AUC={t['ROC-AUC']:.4f}")
+# save results
+
+order = ["Method", "Accuracy", "Precision", "Recall", "F1", "MCC", "ROC-AUC"]
+test_df = pd.DataFrame(test_rows)
+test_df = test_df[order + [c for c in test_df.columns if c not in order]]
+cv_df = pd.DataFrame(cv_rows)
+cv_summary = cv_df.groupby("Method")[order[1:]].agg(["mean", "std"])
+
+OUT = "TabPFN_LargeClass_SMOTE_Results.xlsx" if USE_SMOTE else "TabPFN_LargeClass_Results.xlsx"
+with pd.ExcelWriter(OUT) as w:
+    test_df.round(4).to_excel(w, sheet_name="Test results", index=False)
+    cv_summary.round(4).to_excel(w, sheet_name="CV summary")
+    cv_df.round(4).to_excel(w, sheet_name="CV per fold", index=False)
+    pd.DataFrame(chosen).to_excel(w, sheet_name="Selected features", index=False)
+
+print("\nTest-set results")
+print(test_df[order].round(4).to_string(index=False))
+print("\nSaved:", OUT)
