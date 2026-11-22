@@ -1,0 +1,475 @@
+# LONG METHOD CODE SMELL - RNN, LSTM, BiLSTM, GRU AND BiGRU
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.feature_selection import SelectKBest, chi2, mutual_info_classif
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
+from sklearn.preprocessing import MinMaxScaler, FunctionTransformer
+from sklearn.metrics import (f1_score, precision_score, recall_score,
+                             accuracy_score, matthews_corrcoef, confusion_matrix,
+                             roc_auc_score, make_scorer)
+
+import matplotlib
+matplotlib.use("Agg")           # drop this line to show charts inline in Colab
+import matplotlib.pyplot as plt
+
+from imblearn.pipeline import Pipeline          # NOT sklearn's - skips SMOTE at predict
+from imblearn.over_sampling import SMOTE
+
+import torch
+import torch.nn as nn
+
+DATA_FILE   = "Python_LongMethodSmell_Dataset.csv"
+TARGET      = "Experince Based"
+SEED        = 42
+TEST_SHARE  = 0.10          # 9:1 split
+N_SPLITS    = 10             # 10-fold cross-validation
+K_FEATURES  = 14            # number of metrics kept by each feature selection method
+OUT         = "."
+
+torch.set_num_threads(2)
+class _RecurrentNet(nn.Module):
+    def __init__(self, n_features, cell, emb, hidden, dropout):
+        super().__init__()
+        # embedding: metric j with value v becomes the vector v * W_j + b_j
+        self.w = nn.Parameter(torch.randn(n_features, emb) * 0.1)
+        self.b = nn.Parameter(torch.zeros(n_features, emb))
+        self.bidirectional = cell in ("bilstm", "bigru")
+        if cell == "rnn":
+            self.rnn = nn.RNN(emb, hidden, batch_first=True, nonlinearity="tanh")
+        elif cell in ("gru", "bigru"):
+            self.rnn = nn.GRU(emb, hidden, batch_first=True,
+                              bidirectional=self.bidirectional)
+        else:
+            self.rnn = nn.LSTM(emb, hidden, batch_first=True,
+                               bidirectional=self.bidirectional)
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Linear(hidden * (2 if self.bidirectional else 1), 1)
+
+    def forward(self, x):                                   # x: (rows, features)
+        seq = x.unsqueeze(-1) * self.w + self.b             # (rows, features, emb)
+        _, state = self.rnn(seq)
+        h = state[0] if isinstance(state, tuple) else state  # LSTM returns (h, c)
+        h = torch.cat([h[-2], h[-1]], dim=1) if self.bidirectional else h[-1]
+        return self.head(self.drop(h)).squeeze(1)          # one logit per row
+
+
+class RecurrentClassifier(ClassifierMixin, BaseEstimator):
+    """cell = 'rnn', 'lstm', 'bilstm', 'gru' or 'bigru'."""
+
+    def __init__(self, cell="lstm", emb=16, hidden=32, dropout=0.3, lr=1e-3,
+                 batch_size=32, max_epochs=150, patience=15, val_share=0.15,
+                 random_state=SEED):
+        self.cell = cell
+        self.emb = emb
+        self.hidden = hidden
+        self.dropout = dropout
+        self.lr = lr
+        self.batch_size = batch_size
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.val_share = val_share
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        torch.manual_seed(self.random_state)
+        rng = np.random.default_rng(self.random_state)
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        y01 = (y == self.classes_[1]).astype(np.float32)
+
+        # early stopping watches a validation slice of the training rows
+        Xa, Xv, ya, yv = train_test_split(X, y01, test_size=self.val_share,
+                                          stratify=y01, random_state=self.random_state)
+        Xa, Xv, ya, yv = map(torch.tensor, (Xa, Xv, ya, yv))
+
+        self.net_ = _RecurrentNet(X.shape[1], self.cell, self.emb, self.hidden,
+                                  self.dropout)
+        opt = torch.optim.Adam(self.net_.parameters(), lr=self.lr, weight_decay=1e-4)
+        loss_fn = nn.BCEWithLogitsLoss()
+        best, best_state, waited = np.inf, None, 0
+        for epoch in range(self.max_epochs):
+            self.net_.train()
+            order = rng.permutation(len(Xa))
+            for s in range(0, len(order), self.batch_size):
+                idx = order[s:s + self.batch_size]
+                opt.zero_grad()
+                loss_fn(self.net_(Xa[idx]), ya[idx]).backward()   # forward + backward
+                opt.step()                                         # update weights
+            self.net_.eval()
+            with torch.no_grad():
+                v = loss_fn(self.net_(Xv), yv).item()
+            if v < best - 1e-4:
+                best, waited = v, 0
+                best_state = {k: t.clone() for k, t in self.net_.state_dict().items()}
+            else:
+                waited += 1
+                if waited >= self.patience:
+                    break
+        self.net_.load_state_dict(best_state)
+        self.epochs_used_ = epoch + 1
+        return self
+
+    def predict_proba(self, X):
+        self.net_.eval()
+        with torch.no_grad():
+            p = torch.sigmoid(self.net_(torch.tensor(np.asarray(X, dtype=np.float32)))).numpy()
+        return np.column_stack([1 - p, p])
+
+    def predict(self, X):
+        return self.classes_[(self.predict_proba(X)[:, 1] >= 0.5).astype(int)]
+df = pd.read_csv(DATA_FILE)
+df.columns = [c.strip().lstrip("﻿") for c in df.columns]
+features = [c for c in df.columns if c != TARGET]
+
+print("STEP 1 - remove duplicates")
+print(f"  rows before          : {len(df)}")
+df = df.drop_duplicates().reset_index(drop=True)
+print(f"  rows after           : {len(df)}")
+conflicts = df.duplicated(subset=features, keep=False).sum()
+print(f"  same metrics, different label: {conflicts} rows")
+
+X = df[features]
+y = df[TARGET].astype(int)
+print(f"  clean {(y == 0).sum()} / long method {(y == 1).sum()}   "
+      f"({(y == 0).sum() / (y == 1).sum():.2f} : 1)")
+X_dev, X_test, y_dev, y_test = train_test_split(
+    X, y, test_size=TEST_SHARE, stratify=y, random_state=SEED)
+print("\nSTEP 2 - stratified 9:1 split")
+print(f"  training (90%) : {len(X_dev):4d} rows   {(y_dev == 0).sum()} clean / "
+      f"{(y_dev == 1).sum()} long method")
+print(f"  test (10%)     : {len(X_test):4d} rows   {(y_test == 0).sum()} clean / "
+      f"{(y_test == 1).sum()} long method")
+def information_gain(X, y):
+    """Mutual information between each metric and the label."""
+    return mutual_info_classif(X, y, random_state=SEED)
+
+
+def fisher_score(X, y):
+    """Between-class spread of the means divided by the within-class spread."""
+    X, y = np.asarray(X, dtype=float), np.asarray(y)
+    overall = X.mean(axis=0)
+    between = np.zeros(X.shape[1])
+    within = np.zeros(X.shape[1])
+    for label in np.unique(y):
+        rows = X[y == label]
+        between += len(rows) * (rows.mean(axis=0) - overall) ** 2
+        within += len(rows) * rows.var(axis=0)
+    return between / (within + 1e-12)
+
+
+SELECTORS = {
+    "All features":     None,              # baseline: no selection
+    "Chi-square":       chi2,
+    "Information gain": information_gain,
+    "Fisher score":     fisher_score,
+}
+def build_pipeline(cell, selector_name):
+    steps = [("log",   FunctionTransformer(np.log1p)),     # tame very skewed metrics
+             ("scale", MinMaxScaler())]                     # every metric to 0-1
+    score_func = SELECTORS[selector_name]
+    if score_func is not None:
+        steps.append(("select", SelectKBest(score_func, k=K_FEATURES)))   # keep best K
+    steps += [("smote", SMOTE(random_state=SEED)),          # balance training rows only
+              ("model", RecurrentClassifier(cell=cell))]
+    return Pipeline(steps)
+
+
+MODELS = {"RNN": "rnn", "LSTM": "lstm", "BiLSTM": "bilstm", "GRU": "gru", "BiGRU": "bigru"}
+METRICS = ["accuracy", "precision", "recall", "f1", "mcc", "roc_auc"]
+LABELS = {"accuracy": "Accuracy", "precision": "Precision", "recall": "Recall",
+          "f1": "F1", "mcc": "MCC", "roc_auc": "ROC-AUC"}
+SCORING = {"accuracy": "accuracy", "precision": "precision", "recall": "recall",
+           "f1": "f1", "mcc": make_scorer(matthews_corrcoef), "roc_auc": "roc_auc"}
+folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+
+prep = Pipeline([("log", FunctionTransformer(np.log1p)), ("scale", MinMaxScaler())])
+X_prep = prep.fit_transform(X_dev)
+ranking = {}
+for sel_name, score_func in SELECTORS.items():
+    if score_func is None:
+        continue
+    result = score_func(X_prep, y_dev.values)
+    scores = result[0] if isinstance(result, tuple) else result   # chi2 also returns p-values
+    ranking[sel_name] = pd.Series(scores, index=features).sort_values(ascending=False)
+
+chosen = pd.DataFrame({name: list(r.index[:K_FEATURES]) for name, r in ranking.items()},
+                      index=range(1, K_FEATURES + 1))
+print(f"Top {K_FEATURES} metrics chosen by each method:")
+print(chosen.to_string())
+dropped = {name: sorted(set(features) - set(r.index[:K_FEATURES])) for name, r in ranking.items()}
+print("\nMetrics left out:")
+for name, cols in dropped.items():
+    print(f"  {name:17s}: {', '.join(cols)}")
+print(f"\nSTEP 4 - stratified {N_SPLITS}-fold cross-validation on the 90% part")
+print(f"         {len(SELECTORS)} selectors x {len(MODELS)} models = "
+      f"{len(SELECTORS) * len(MODELS)} setups")
+rows, per_fold = [], []
+for sel_name in SELECTORS:
+    for name, cell in MODELS.items():
+        s = cross_validate(build_pipeline(cell, sel_name), X_dev, y_dev, cv=folds,
+                           scoring=SCORING, error_score="raise")
+        rows.append({"selector": sel_name, "model": name,
+                     **{m: s[f"test_{m}"].mean() for m in METRICS},
+                     **{f"{m}_sd": s[f"test_{m}"].std() for m in METRICS}})
+        for i in range(N_SPLITS):
+            per_fold.append({"selector": sel_name, "model": name, "fold": i + 1,
+                             **{m: s[f"test_{m}"][i] for m in METRICS}})
+        print(f"  done: {sel_name:17s} {name:7s} F1 {rows[-1]['f1']:.4f} "
+              f"+/- {rows[-1]['f1_sd']:.4f}", flush=True)
+
+cv = pd.DataFrame(rows).set_index(["selector", "model"])
+per_fold = pd.DataFrame(per_fold)
+
+print("\nSTEP 5 - every setup trained on the full 90%, tested once on the 10%")
+test_rows, conf = [], {}
+for sel_name in SELECTORS:
+    for name, cell in MODELS.items():
+        model = build_pipeline(cell, sel_name).fit(X_dev, y_dev)
+        p = model.predict(X_test)
+        prob = model.predict_proba(X_test)[:, 1]
+        tn, fp, fn, tp = confusion_matrix(y_test, p).ravel()
+        conf[(sel_name, name)] = np.array([[tn, fp], [fn, tp]])
+        test_rows.append({"selector": sel_name, "model": name,
+                          "accuracy": accuracy_score(y_test, p),
+                          "precision": precision_score(y_test, p, zero_division=0),
+                          "recall": recall_score(y_test, p, zero_division=0),
+                          "f1": f1_score(y_test, p, zero_division=0),
+                          "mcc": matthews_corrcoef(y_test, p),
+                          "roc_auc": roc_auc_score(y_test, prob),
+                          "TN": tn, "FP": fp, "FN": fn, "TP": tp})
+    print(f"  done: {sel_name}", flush=True)
+test = pd.DataFrame(test_rows).set_index(["selector", "model"])
+pd.set_option("display.width", 200)
+sel_order, model_order = list(SELECTORS), list(MODELS)
+
+print("=" * 86)
+print(f"CROSS-VALIDATION F1 (mean of {N_SPLITS} folds, {len(X_dev)} rows): model x selector")
+print("=" * 86)
+print(cv["f1"].unstack(0)[sel_order].loc[model_order].round(4).to_string())
+print("\n--- CROSS-VALIDATION MCC ---")
+print(cv["mcc"].unstack(0)[sel_order].loc[model_order].round(4).to_string())
+print("\n--- average over the 5 models, per selector ---")
+print(cv.groupby(level="selector")[METRICS].mean().loc[sel_order].round(4).to_string())
+
+print("\n" + "=" * 86)
+print("FULL CROSS-VALIDATION PERFORMANCE MATRIX (mean +/- sd)")
+print("=" * 86)
+full = pd.DataFrame({LABELS[m]: [f"{cv.loc[i, m]:.4f} +/- {cv.loc[i, m + '_sd']:.4f}"
+                                 for i in cv.index] for m in METRICS},
+                    index=[f"{s} | {m}" for s, m in cv.index])
+print(full.to_string())
+
+print("\n" + "=" * 86)
+print(f"TEST SET PERFORMANCE MATRIX (10% = {len(X_test)} rows, {(y_test == 1).sum()} large classes)")
+print("=" * 86)
+print(test.round(4).to_string())
+
+best = cv["f1"].idxmax()
+print(f"\n  best on cross-validation F1: {best[0]} + {best[1]} "
+      f"({cv.loc[best, 'f1']:.4f} +/- {cv.loc[best, 'f1_sd']:.4f})")
+gain = (cv["f1"].unstack(0)[sel_order[1:]].sub(cv["f1"].unstack(0)["All features"], axis=0))
+print("\n--- F1 change vs 'All features' (positive = selection helped) ---")
+print(gain.loc[model_order].round(4).to_string())
+print(f"\n  for scale: F1 typically varies by about {cv['f1_sd'].mean():.3f} between folds")
+
+cv.to_csv(f"{OUT}/fslm_performance_matrix_cv.csv")
+per_fold.to_csv(f"{OUT}/fslm_performance_per_fold.csv", index=False)
+test.to_csv(f"{OUT}/fslm_performance_matrix_test.csv")
+print("\nsaved: fslm_performance_matrix_cv.csv, fslm_performance_per_fold.csv, "
+      "fslm_performance_matrix_test.csv")
+COLOURS = {"All features": "#888780", "Chi-square": "#2a78d6",
+           "Information gain": "#eb6834", "Fisher score": "#1baf7a"}
+
+
+def draw_f1_heatmaps():
+    grids = [cv["f1"].unstack(0)[sel_order].loc[model_order].values,
+             test["f1"].unstack(0)[sel_order].loc[model_order].values]
+    lo = min(g.min() for g in grids)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.2), sharey=True)
+    for ax, g, title in zip(axes, grids, [f"Cross-validation F1 ({N_SPLITS} folds)",
+                                          f"Test-set F1 ({len(X_test)} rows)"]):
+        ax.imshow(g, cmap="Blues", vmin=lo - 0.05, vmax=1.0, aspect="auto")
+        for i in range(g.shape[0]):
+            for j in range(g.shape[1]):
+                ax.text(j, i, f"{g[i, j]:.3f}", ha="center", va="center", fontsize=10.5,
+                        color="white" if g[i, j] > (lo + 1) / 2 + 0.05 else "black")
+        ax.set_xticks(range(len(sel_order)))
+        ax.set_xticklabels(sel_order)
+        ax.xaxis.tick_top()
+        ax.set_title(title, pad=28, loc="left")
+        ax.tick_params(length=0)
+    axes[0].set_yticks(range(len(model_order)))
+    axes[0].set_yticklabels(model_order)
+    fig.suptitle(f"F1 by model and feature selection method (K = {K_FEATURES}) - Large Class",
+                 x=0.02, ha="left", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/fs_f1_heatmap.png", dpi=150)
+    plt.show()
+
+
+def draw_metric_bars(metric):
+    fig, ax = plt.subplots(figsize=(12, 5))
+    pos = np.arange(len(model_order))
+    w = 0.8 / len(sel_order)
+    floor = max(0, cv[metric].min() - 0.15)
+    for i, sel in enumerate(sel_order):
+        vals = cv.loc[sel, metric].loc[model_order].values
+        errs = cv.loc[sel, metric + "_sd"].loc[model_order].values
+        bars = ax.bar(pos + (i - (len(sel_order) - 1) / 2) * w, vals, w * 0.95, yerr=errs,
+                      capsize=3, color=COLOURS[sel], label=sel)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, floor + 0.01, f"{v:.3f}",
+                    ha="center", va="bottom", fontsize=8, rotation=90, color="white")
+    ax.set_xticks(pos)
+    ax.set_xticklabels(model_order, fontsize=11)
+    ax.set_ylim(floor, 1.0)
+    ax.set_ylabel(f"{LABELS[metric]} (cross-validation mean +/- sd)")
+    ax.set_title(f"{LABELS[metric]} by model and feature selection method - Large Class",
+                 loc="left", pad=34)
+    ax.legend(frameon=False, ncol=len(sel_order), loc="lower left", bbox_to_anchor=(0, 1.01))
+    ax.grid(axis="y", color="#d9d8d4", lw=0.8)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/fs_{metric}_by_model.png", dpi=150)
+    plt.show()
+
+
+def draw_best_confusion_matrices():
+    fig, axes = plt.subplots(1, len(sel_order), figsize=(4 * len(sel_order), 3.8))
+    for ax, sel in zip(axes, sel_order):
+        name = cv.loc[sel, "f1"].idxmax()            # best model for this selector (by CV)
+        m = conf[(sel, name)]
+        ax.imshow(m, cmap="Blues", vmin=0, vmax=m.sum())
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, str(m[i, j]), ha="center", va="center", fontsize=15,
+                        color="white" if m[i, j] > m.sum() / 2 else "black")
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["clean", "large"])
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(["clean", "large"])
+        ax.set_xlabel("predicted")
+        ax.set_ylabel("actual")
+        ax.set_title(f"{sel}\n{name} (test F1 {test.loc[(sel, name), 'f1']:.3f})",
+                     fontsize=11, loc="left")
+    fig.suptitle("Test-set confusion matrix of the best model per selection method",
+                 x=0.02, ha="left", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/fslm_confusion_matrices.png", dpi=150)
+    plt.show()
+
+
+draw_f1_heatmaps()
+draw_metric_bars("f1")
+draw_metric_bars("mcc")
+draw_best_confusion_matrices()
+import os
+from scipy.stats import friedmanchisquare, wilcoxon
+from statsmodels.stats.multitest import multipletests
+
+ALPHA = 0.05
+METRIC = "mcc"                                    # score compared across folds
+TABPFN_FILE = "/content/TabPFN_LongMethod_SMOTE_Results_2.xlsx"   # optional
+TABPFN_NAMES = {"All features": "All features", "Chi-Square": "Chi-square",
+                "Information Gain": "Information gain", "Fisher Score": "Fisher score"}
+
+# ---- per-fold scores: recurrent models (+ TabPFN if its file is uploaded) ----
+folds_df = per_fold[["selector", "model", "fold", METRIC]].copy()
+if os.path.exists(TABPFN_FILE):
+    t = pd.read_excel(TABPFN_FILE, sheet_name="CV per fold")
+    t = pd.DataFrame({"selector": t["Method"].map(TABPFN_NAMES), "model": "TabPFN",
+                      "fold": t["Fold"], METRIC: t["MCC"]})
+    folds_df = pd.concat([folds_df, t], ignore_index=True)
+    print("TabPFN per-fold results added.")
+else:
+    print("TabPFN file not found - testing the recurrent models only.")
+
+all_models = list(folds_df["model"].unique())
+
+
+def scores(model, selector):
+    """MCC of one model + selector, ordered by fold (1..10)."""
+    rows = folds_df[(folds_df.model == model) & (folds_df.selector == selector)]
+    return rows.sort_values("fold")[METRIC].values
+
+
+def wilcoxon_p(a, b):
+    """Two-sided Wilcoxon signed-rank p-value (1.0 if the folds are identical)."""
+    if np.allclose(a - b, 0):
+        return 1.0
+    return wilcoxon(a, b).pvalue
+
+
+def add_holm(table):
+    """Holm-corrected p-values for one family of comparisons."""
+    reject, p_holm, _, _ = multipletests(table["p"], alpha=ALPHA, method="holm")
+    table["p_holm"] = p_holm
+    table["significant (Holm)"] = np.where(reject, "yes", "no")
+    return table
+
+
+# ---- 1. Friedman: are the models different, within each feature set? ----
+friedman = []
+for sel in sel_order:
+    stat, p = friedmanchisquare(*[scores(m, sel) for m in all_models])
+    friedman.append({"feature set": sel, "chi2": stat, "p": p})
+friedman = add_holm(pd.DataFrame(friedman))
+print("\n1. FRIEDMAN TEST - all models compared within each feature set")
+print(friedman.round(4).to_string(index=False))
+
+# ---- 2. Wilcoxon: each feature-selection method vs all features ----
+fs = []
+for m in all_models:
+    base = scores(m, "All features")
+    for sel in sel_order[1:]:
+        s = scores(m, sel)
+        fs.append({"model": m, "selector": sel,
+                   "mean diff": (s - base).mean(),
+                   "better folds": int((s > base).sum()),
+                   "worse folds": int((s < base).sum()),
+                   "p": wilcoxon_p(s, base)})
+fs = add_holm(pd.DataFrame(fs))
+print("\n2. WILCOXON - feature selection vs all features")
+print(fs.round(4).to_string(index=False))
+
+# ---- 3. Wilcoxon: bidirectional vs unidirectional ----
+bi = []
+for b, u in [("BiLSTM", "LSTM"), ("BiGRU", "GRU")]:
+    for sel in sel_order:
+        sb, su = scores(b, sel), scores(u, sel)
+        bi.append({"comparison": f"{b} vs {u}", "feature set": sel,
+                   "mean diff": (sb - su).mean(), "p": wilcoxon_p(sb, su)})
+bi = add_holm(pd.DataFrame(bi))
+print("\n3. WILCOXON - bidirectional vs unidirectional")
+print(bi.round(4).to_string(index=False))
+
+# ---- 4. Wilcoxon: best recurrent model vs TabPFN (same feature set) ----
+vs_tab = None
+if "TabPFN" in all_models:
+    rec = [m for m in all_models if m != "TabPFN"]
+    vs_tab = []
+    for sel in sel_order:
+        best_rec = max(rec, key=lambda m: scores(m, sel).mean())
+        sr, st = scores(best_rec, sel), scores("TabPFN", sel)
+        vs_tab.append({"feature set": sel, "best recurrent": best_rec,
+                       "mean diff (rec - TabPFN)": (sr - st).mean(),
+                       "p": wilcoxon_p(sr, st)})
+    vs_tab = add_holm(pd.DataFrame(vs_tab))
+    print("\n4. WILCOXON - best recurrent model vs TabPFN")
+    print(vs_tab.round(4).to_string(index=False))
+
+# ---- save everything to one Excel file ----
+with pd.ExcelWriter(f"{OUT}/fslm_statistical_tests.xlsx") as xl:
+    friedman.to_excel(xl, sheet_name="Friedman", index=False)
+    fs.to_excel(xl, sheet_name="Selection vs all", index=False)
+    bi.to_excel(xl, sheet_name="Bi vs uni", index=False)
+    if vs_tab is not None:
+        vs_tab.to_excel(xl, sheet_name="Recurrent vs TabPFN", index=False)
+print("\nsaved: fslm_statistical_tests.xlsx")
+
